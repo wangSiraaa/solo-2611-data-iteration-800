@@ -1,8 +1,9 @@
-# 独立源段目录 + 多语言交付仓
+# 独立源段目录 + 多语言交付仓 + 术语册与地区用字版
 
-Python 3.11，SQLite。**两侧物理分离**：源段目录与交付仓各自持有一个 SQLite
-数据库；交付侧通过只读连接（`mode=ro`）真实读取源目录**已发布的源产品**，
-不把位置编号当身份，也不缓存源状态。文本全部为合成内容，不做自动翻译或语义评估。
+Python 3.11，SQLite。**两侧物理分离**：源段目录（含术语册）与交付仓各自持有
+SQLite 数据库；交付侧通过只读连接（`mode=ro`）读取源目录**已发布的源产品**与
+**已发布的术语册版本**，不把位置编号当身份，也不缓存源状态。文本全部为合成内容，
+不做自动翻译、词义识别或句子生成。
 
 ## 快速运行
 
@@ -10,9 +11,11 @@ Python 3.11，SQLite。**两侧物理分离**：源段目录与交付仓各自�
 # 端到端跑完 materials/753 全部场景（含用只读客户端读新旧包）
 python3 run_demo.py
 
+# 地区用字版端到端场景（本文下方“地区版例子”的全部数字）
+python3 -m delivery_system demo-regional
+
 # 仅验证真实包文件
 python3 materials/753/package_reader.py data/packages/PACK1.json
-python3 materials/753/package_reader.py data/packages/PACK2.json
 
 # 测试（标准库 unittest，无需 pytest）
 python3 -m unittest discover -s tests -v
@@ -22,69 +25,100 @@ python3 -m unittest discover -s tests -v
 
 ```
 delivery_system/
-  models.py              不可变值对象：SourceSegment/SourceProduct/SourceRef/
-                         TranslationEntry/CoverChunk/CoverDiagnosis/CoverResult
+  models.py              不可变值对象：SourceSegment/SourceProduct/TranslationEntry/...
   source_catalog.py      源段目录（独立 SQLite + 发布快照 + release 历史）
                          + PublishedSourceReader（交付侧只读句柄）
+  terminology.py         术语册：概念/章节树/拼写绑定/段归属/人工标记 + 不可变版本
+                         + PublishedTerminologyReader（交付侧只读合同）
   coverage.py            条目评估 + 精确覆盖区间 DP + 失败诊断
-  delivery_repository.py 译文条目、覆盖计划、不可变发布包（独立 SQLite）
-  package_io.py          translation-package/1 写入与结构/覆盖校验
+  regional.py            地区版纯求解器：替稿可用性、概念一致性 DP、互斥约束核
+  delivery_repository.py 译文条目、覆盖计划、不可变发布包、地区替稿/锁定/地区版
+  package_io.py          translation-package/1 与 regional-edition/1 写入与校验
   cli.py / __main__.py   命令行
-  demo.py                materials/753 端到端复现（调用官方 package_reader.py）
-tests/test_delivery.py   20 个测试：覆盖、过期、重组、不可变、规模
+  demo.py                materials/753 端到端复现
+  demo_regional.py       地区用字版端到端复现
+tests/                   57 个测试：覆盖、过期、重组、不可变、规模、术语解析、地区决策
 ```
 
-## 两侧的实质逻辑
+## 源段目录与交付仓（既有能力，未变）
 
-### 源段目录（写入侧 + 只读快照）
-- `segment_id` 是身份；`position` 只是当前序位，重排只改位置不改身份/修订。
-- 每段有独立 `revision`。`revise_segment` 只增修订、不改旧修订号——不存在
-  “把旧译文贴上 2 号修订”这一动作的入口。
-- 每次结构性变更（建/增/删/改/移）都写一条 `source_releases` 快照，
-  `latest_release_id` / `product_at_release` 可回溯历史源状态。
-- `PublishedSourceReader` 用 `file:...?mode=ro` 打开，每次调用重新读取，
-  交付侧无法写源库；它读到的是**当前已发布**的源产品，因此源更正立即生效。
+- `segment_id` 是身份；`position` 只是当前序位。每段独立 `revision`，旧修订
+  永不改标签。每次结构性变更写一条 `source_releases` 快照。
+- 译文条目精确存储 `(segment_id, revision)`；只有 `current_usable` 可入选。
+- `plan_cover` 在区间上做可达性 DP，拒绝“并集覆盖”假象；失败给出
+  `no_current_cover` / `no_exact_cover` / `empty_source` 诊断。
+- 发布包 `translation-package/1` 不可变；旧包与旧读者（`package_reader.py`）
+  保持可用。
 
-### 交付仓（选择侧 + 产品侧）
-- 译文条目精确存储 `(segment_id, revision)`；`add_translation` 对同 id
-  不同内容直接拒绝（幂等重放相同内容除外），无法改标签冒充补译。
-- `assess` 把每条当前语言条目判为：
-  `current_usable` / `stale_revision` / `non_contiguous` / `unknown_segment` /
-  `malformed` / `empty_text` / `other_language`。**只有 `current_usable` 可入选**。
-  过期/不连续/重复引用/空文本一律留作历史，不是当前候选。
-- `plan_cover` 在**区间**上做可达性动态规划：起点 0 能否沿合法连续区间一步步到达 n。
-  这正是不被“并集覆盖”忽悠的关键——重叠条目可能覆盖并集却无法按序不重不漏拼装。
-  任意合法完整覆盖即可（不要求唯一/最少条目），按 id 字典序确定性地选一条。
-- 生成时强制不变量：选中 `source_ids` 拼接必须精确等于源序；任一块文本非空；
-  整体渲染文本非空。**无法交付时绝不产出空文本成功包。**
+## 术语册（源目录新增，人工标引）
 
-### 失败诊断（可交付性依据）
-- `no_current_cover`：某些段没有任何当前可用译文，给出具体 `uncovered_segment_ids`。
-- `no_exact_cover`：并集覆盖全部段，但有序精确覆盖不存在；给出
-  `blocked_boundary`（装配卡住的位置）与 `crossing_translation_ids`（跨该边界、
-  又不能拆开的条目），以及被排除条目及原因。FR 的 F12/F23/F4 即此例。
-- `empty_source`：空源拒绝发布空包。
+- **概念**（concept）是稳定身份；**章**有上级章，构成树。
+- **绑定**：同一章内同一拼写最多绑定一个概念（`set_binding` 为替换语义）；
+  同一概念在不同章可有不同原词；同一拼写在不同章可指不同概念。
+- **解析**：标记的概念 = 从该段所属章**向上取最近绑定**（子章覆盖、父章继承）。
+- **标记**（marker）人工标引 `(segment_id, segment_revision, spelling)`，
+  身份跨术语册版本稳定；地区替稿按标记身份声明用字。
+- **版本**：`term-publish` 把章节树、段所属章、标记所在段修订及拼写冻结进
+  同一个可复核的术语册版本。版本独立于源段修订与译文字节——移动一段到另一章
+  只出新术语册版本，原文与译块字节不变；旧版本永远可读。
+- **禁止**（发布时校验，拒绝入库）：章节环、悬空段（文档段无章归属，或归属/
+  标记指向不存在的对象）、无定义标记（拼写自所属章向上无任何绑定）。
+- 交付仓通过 `PublishedTerminologyReader`（`mode=ro`，每次调用重读）取得
+  每个标记的概念身份；地区编辑不直接读写源库。
 
-### 发布包（translation-package/1）
-固定 `package_id/document_id/language/source_snapshot(segment_id+revision)` 及按输出顺序的
-`chunks(translation_id/source_ids/text)`，另加 `source_revisions/rendered_text/
-content_sha256/created_at/source_release`。包一旦写入即不可变：同 id 不同内容
-抛 `PackageExistsImmutable`；旧包的原文快照与译文 id 永不改写（PACK1 保持 rev1）。
+## 地区用字版（交付仓新增）
 
-## materials/753 复现结果
+- **派生**：地区版只从**实际已发布**的包派生（`base_package_id` 必须存在）。
+- **替稿**：对已选译块，地区编辑给出有限套整句替稿：完整文字 + 该块每个标记
+  的用字编号（按标记身份，恰好一次）+ 非负改稿成本。同一概念在块内被赋不同值
+  的替稿不可用；标记集合不符、用字越界（1..3）的替稿同样剔除并记录原因。
+- **锁定**：地区可预先锁定部分概念的用字（可改、可删）。
+- **求解**：每块选一套，同一概念跨块取值一致，全书总成本最小；并列时取按包内
+  块序比较字典序最小的替稿编号序列。无标记的块保留原文、成本 0。规模上限：
+  至多 12 个实际概念、每个最多 3 种用字（超出报错）。
+- **不可行**：给出不可约的互斥约束核（锁 + 块的候选集合；去掉任一成员即可行），
+  不写出半本书——`regional_editions` 不落行、磁盘不落文件。
+- **冻结**：`regional-edition/1` 记录实际文字、所选编号、总成本、概念取值及
+  **对应源术语版本**；同 id 不同内容拒绝（不可变）。重开库后按指定版本重解，
+  术语解析与地区决策逐字节重现（`content_sha256` 相同）。
 
-| 步骤 | 结果 |
+## 地区版例子（demo-regional 实际跑出）
+
+两个块都含概念 P：块一 P=甲(0)/乙(2)，块二 P=甲(5)/乙(0)。
+
+| 场景 | 结果 |
 |---|---|
-| EN 初始发布 PACK1 | 合法覆盖 `T1+T23+T4`（或 `T12+T3+T4`，二者皆合法） |
-| FR 尝试发布 | 拒收：`no_exact_cover`，并集含四段但 F12/F23 在 S2 重叠且不可拆 |
-| 更正 S2→rev2 | T12/T23/F12/F23 变 `stale_revision`；EN 缺 S2 (`no_current_cover`) |
-| 补 T2_NEW(rev2) | EN 重建 `T1+T2_NEW+T3+T4`，发布 PACK2（S2@2） |
-| 读旧包 PACK1 | 仍为 S1@1..S4@1 与旧译文 id/文本 |
+| 无锁（术语册 V1） | 两处取乙，总成本 **2** |
+| 锁 P=甲（V1） | 总成本 **5** |
+| S2 移到“port→Q”的章并发布 V2，报价与锁不动 | 块一取甲、块二取乙，总成本 **0**，概念取值 {P:1, Q:2} |
 
-`package_reader.py` 被以子进程方式真实读取新旧两个包并校验输出。
+另演示：一句整句同时约束概念 P 与 R（C1/C2 各自绑定两者），每套局部报价都是 0，
+但全局无可行译本——求解器指出互斥约束核 {T_C, T_D} 且不产生任何地区版文件。
+普通包 PACK 仍被 `package_reader.py` 正常读取。
+
+## 常用命令
+
+```bash
+# 术语册（源侧）
+delivery term-concept-add P --label "电气端口"
+delivery term-chapter-add ELEC --parent ROOT
+delivery term-bind ELEC port P          # 章内拼写→概念（替换语义）
+delivery term-assign S1 ELEC            # 段归属（移动段即改归属）
+delivery term-marker-add M1 S1 1 port   # 人工标记：段、段修订、拼写
+delivery term-publish                   # 冻结新术语册版本
+delivery term-show --version 1          # 只读复核某一版本
+
+# 地区版（交付侧，源库只读）
+delivery regional-quote-add TW T_A A1 --text "整句…" --assignments '{"M1":1}' --cost 0
+delivery regional-lock-set TW P 1
+delivery regional-solve TW PK_A --terminology-version 1 [--save-as ED1]
+delivery regional-publish TW PK_A ED1 --terminology-version 1
+delivery regional-edition-show ED1
+```
 
 ## 规模与不扩平台
 
 测试覆盖 100 源段 / 5 语言 / ≥500 译文（含大量重叠诱饵），验证每语言精确覆盖、
-诱饵从不入选、更正后按缺口隔离、补译后恢复。覆盖是 O(n·k) 区间 DP，
-足以支撑题目规模；未引入翻译、语义评分、账号等平台能力。
+诱饵从不入选、更正后按缺口隔离、补译后恢复。覆盖是 O(n·k) 区间 DP；地区求解是
+按块序的状态 DP（状态仅为“后续块仍涉及的概念”的部分赋值），足以支撑
+12 概念 × 3 用字的题目规模。未引入翻译、词义识别、自动造句、账号等平台能力。
